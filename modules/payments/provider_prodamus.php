@@ -2,78 +2,152 @@
 require_once __DIR__ . '/../../lib/logger.php';
 require_once __DIR__ . '/../../lib/helpers.php';
 require_once __DIR__ . '/../../lib/response.php';
+require_once __DIR__ . '/../../lib/prodamus_hmac.php';
+require_once __DIR__ . '/../../config/config.php';
 
 /**
  * Обработчик Prodamus PayForm.
+ * Принимает POST multipart/form-data (основной кейс по докам) или JSON, проверяет подпись Sign и
+ * возвращает унифицированное событие для dispatcher.
  */
 function provider_prodamus_handle($headers, $rawBody)
 {
     $config = require __DIR__ . '/../../config/payments.php';
-    $bodyData = json_decode($rawBody, true);
-    if ($bodyData === null) {
-        logger_error('Prodamus: некорректный JSON', 'payments');
-        return false;
+    $channel = 'payments/prodamus';
+
+    $data = array();
+    if (!empty($_POST)) {
+        $data = $_POST;
+    } else {
+        $decoded = json_decode($rawBody, true);
+        if (is_array($decoded)) {
+            $data = $decoded;
+        }
     }
 
+    $payloadForLog = !empty($_POST) ? json_encode($_POST, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : $rawBody;
+    logger_info('Prodamus webhook сырой: ' . $payloadForLog, $channel);
+
+    if (!is_array($data) || count($data) === 0) {
+        logger_error('Prodamus: пустое тело запроса', $channel);
+        response_error('Некорректные данные', 400);
+    }
+
+    $signHeader = provider_prodamus_extract_sign($headers);
+    if ($signHeader === '') {
+        logger_error('Prodamus: отсутствует заголовок Sign', $channel);
+        response_error('Отсутствует подпись', 400);
+    }
+
+    if (!isset($config['prodamus']['secret_keys']) || !is_array($config['prodamus']['secret_keys'])) {
+        logger_error('Prodamus: не настроены secret_keys', $channel);
+        response_error('Конфигурация Prodamus отсутствует', 500);
+    }
+
+    $signatureValid = false;
+    foreach ($config['prodamus']['secret_keys'] as $secretKey) {
+        if (Hmac::verify($data, $secretKey, $signHeader)) {
+            $signatureValid = true;
+            break;
+        }
+    }
+
+    if (!$signatureValid) {
+        logger_error('Prodamus: подпись не совпала', $channel);
+        response_error('Неверная подпись', 400);
+    }
+
+    if (!isset($data['order_num'])) {
+        logger_error('Prodamus: отсутствует order_num', $channel);
+        response_error('Отсутствует номер заказа', 400);
+    }
+
+    $orderNumRaw = $data['order_num'];
+    $primaryPart = $orderNumRaw;
+    if (strpos($orderNumRaw, '-') !== false) {
+        $parts = explode('-', $orderNumRaw);
+        $primaryPart = $parts[0];
+    }
+    $primaryNumeric = intval($primaryPart);
+
+    $orderType = 'course';
+    $internalOrderId = $primaryNumeric;
+    if ($primaryNumeric >= BASE_CERT_ORDER_NUM) {
+        $orderType = 'certificate';
+        $internalOrderId = $primaryNumeric - BASE_CERT_ORDER_NUM;
+    }
+
+    $statusRaw = isset($data['payment_status']) ? $data['payment_status'] : '';
+    $statusNormalized = provider_prodamus_normalize_status($statusRaw);
+    if ($statusNormalized === 'unknown') {
+        logger_error('Prodamus: неизвестный статус ' . $statusRaw, $channel);
+    }
+
+    $amount = isset($data['sum']) ? floatval($data['sum']) : 0;
+    $currency = isset($data['currency']) ? $data['currency'] : $config['prodamus']['default_currency'];
+    $amountRub = $amount;
+    if (strtolower($currency) !== 'rub') {
+        $amountRub = $amount; // TODO: добавить конвертацию валют при наличии курса.
+    }
+
+    $metadata = $data;
+    $isPartial = false;
+    if (isset($metadata['products']) && is_array($metadata['products'])) {
+        foreach ($metadata['products'] as $product) {
+            if (isset($product['name']) && strpos($product['name'], 'Частичная оплата') !== false) {
+                $isPartial = true;
+            }
+        }
+    }
+    if (isset($metadata['_param_partial']) && intval($metadata['_param_partial']) === 1) {
+        $isPartial = true;
+    }
+
+    $event = array(
+        'provider' => 'prodamus',
+        'provider_type' => 'payform',
+        'order_id' => $internalOrderId,
+        'order_type' => $orderType,
+        'order_raw' => $orderNumRaw,
+        'status_raw' => $statusRaw,
+        'status' => $statusNormalized,
+        'amount' => $amount,
+        'amount_rub' => $amountRub,
+        'currency' => $currency,
+        'external_payment_id' => isset($data['order_id']) ? $data['order_id'] : '',
+        'is_partial' => $isPartial,
+        'is_refund' => false,
+        'provider_commission' => isset($data['commission_sum']) ? floatval($data['commission_sum']) : 0,
+        'internal_diff_amount' => 0,
+        'created_at_provider' => isset($data['date']) ? $data['date'] : '',
+        'metadata' => $metadata,
+        'payload_raw' => !empty($payloadForLog) ? $payloadForLog : $rawBody
+    );
+
+    logger_info('Prodamus: событие подготовлено ' . json_encode($event, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), $channel);
+    return $event;
+}
+
+function provider_prodamus_extract_sign($headers)
+{
     $signHeader = '';
     foreach ($headers as $key => $value) {
         if (strtolower($key) === 'sign') {
             $signHeader = $value;
         }
     }
-
-    $expectedSign = provider_prodamus_signature($rawBody, $config['prodamus']);
-    if ($signHeader === '' || $signHeader !== $expectedSign) {
-        logger_error('Prodamus: подпись не совпала', 'payments');
-        return false;
-    }
-
-    if (!isset($bodyData['payment_status']) || $bodyData['payment_status'] !== 'success') {
-        logger_info('Prodamus: статус не success, пропускаем', 'payments');
-        return false;
-    }
-
-    if (!isset($bodyData['order_num'])) {
-        logger_error('Prodamus: отсутствует order_num', 'payments');
-        return false;
-    }
-
-    $orderIdParts = explode('-', $bodyData['order_num']);
-    $orderId = intval($orderIdParts[0]);
-    $amount = isset($bodyData['amount']) ? floatval($bodyData['amount']) : 0;
-    $currency = isset($bodyData['currency']) ? $bodyData['currency'] : $config['prodamus']['default_currency'];
-
-    $event = array(
-        'provider' => 'prodamus',
-        'provider_type' => 'payform',
-        'order_id' => $orderId,
-        'order_type' => 'course',
-        'order_raw' => $bodyData['order_num'],
-        'status_raw' => 'success',
-        'status' => 'success',
-        'amount' => $amount,
-        'amount_rub' => $amount,
-        'currency' => $currency,
-        'external_payment_id' => isset($bodyData['payment_id']) ? $bodyData['payment_id'] : '',
-        'is_partial' => false,
-        'is_refund' => false,
-        'provider_commission' => isset($bodyData['fee']) ? floatval($bodyData['fee']) : 0,
-        'internal_diff_amount' => 0,
-        'created_at_provider' => isset($bodyData['created_at']) ? $bodyData['created_at'] : '',
-        'metadata' => $bodyData,
-        'payload_raw' => $rawBody
-    );
-
-    // Определение частичной оплаты и разниц можно расширить при наличии данных о курсе.
-    if (isset($bodyData['is_partial']) && $bodyData['is_partial']) {
-        $event['is_partial'] = true;
-    }
-
-    return $event;
+    return $signHeader;
 }
 
-function provider_prodamus_signature($rawBody, $config)
+function provider_prodamus_normalize_status($statusRaw)
 {
-    $secret = $config['secret_main'];
-    return hash_hmac('sha256', $rawBody, $secret);
+    $status = 'unknown';
+    if ($statusRaw === 'success') {
+        $status = 'success';
+    } elseif ($statusRaw === 'order_canceled') {
+        $status = 'cancelled';
+    } elseif ($statusRaw === 'order_denied') {
+        $status = 'failed';
+    }
+    return $status;
 }

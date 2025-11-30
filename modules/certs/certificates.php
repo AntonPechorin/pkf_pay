@@ -6,10 +6,11 @@ require_once __DIR__ . '/../orders/cert_orders.php';
 require_once __DIR__ . '/../../config/config.php';
 
 /**
- * Обработка платежа для заказа сертификата.
+ * Обработка платежа для заказа сертификата по унифицированному событию.
  */
-function certs_handle_payment_result($orderId, $paymentProvider, $paymentStatus, $paidAmount, $paidCurrency, $rawPayloadJson, $connection)
+function certs_handle_payment_result($event, $connection)
 {
+    $orderId = intval($event['order_id']);
     $order = cert_orders_get_by_id($connection, $orderId);
     if ($order === null) {
         logger_error('Сертификат: заказ не найден id=' . $orderId, 'payments');
@@ -17,20 +18,29 @@ function certs_handle_payment_result($orderId, $paymentProvider, $paymentStatus,
     }
 
     $historyPayload = cert_orders_append_payload($order, array(
-        'status' => $paymentStatus,
-        'provider' => $paymentProvider,
-        'amount' => $paidAmount,
-        'currency' => $paidCurrency,
-        'payload' => $rawPayloadJson,
+        'provider' => $event['provider'],
+        'status_raw' => $event['status_raw'],
+        'status' => $event['status'],
+        'amount' => $event['amount'],
+        'currency' => $event['currency'],
+        'external_payment_id' => $event['external_payment_id'],
+        'metadata' => $event['metadata'],
+        'created_at_provider' => isset($event['created_at_provider']) ? $event['created_at_provider'] : '',
+        'payload' => $event['payload_raw'],
         'time' => date(DATE_FORMAT_FULL)
     ));
 
-    $statusToSet = $order['status'];
-    if ($paymentStatus === 'success') {
+    $statusToSet = isset($order['status']) ? $order['status'] : 'pending_payment';
+    if ($event['status'] === 'success') {
         $statusToSet = 'paid';
+    } elseif ($event['status'] === 'cancelled' || $event['status'] === 'failed') {
+        $statusToSet = 'payment_failed';
     }
 
-    if (!cert_orders_update_payment_fields($connection, $orderId, $paymentProvider, '', $paymentStatus, $historyPayload)) {
+    $paymentStatus = isset($event['status_raw']) ? $event['status_raw'] : $event['status'];
+    $externalPaymentId = isset($event['external_payment_id']) ? $event['external_payment_id'] : '';
+
+    if (!cert_orders_update_status_and_payment($connection, $orderId, $event['provider'], $externalPaymentId, $paymentStatus, $statusToSet, $historyPayload)) {
         logger_error('Сертификат: не удалось обновить заказ', 'payments');
         return array('success' => false, 'error' => 'Не удалось обновить заказ');
     }
@@ -40,11 +50,11 @@ function certs_handle_payment_result($orderId, $paymentProvider, $paymentStatus,
         return array('success' => true, 'certificate' => $cert);
     }
 
-    if ($paymentStatus !== 'success') {
+    if ($event['status'] !== 'success') {
         return array('success' => true, 'certificate' => null);
     }
 
-    $certCreate = certs_create_certificate($connection, $order, $paymentProvider, $paidAmount, $rawPayloadJson);
+    $certCreate = certs_create_certificate($connection, $order, $event);
     if ($certCreate === false) {
         return array('success' => false, 'error' => 'Не удалось создать сертификат');
     }
@@ -62,7 +72,7 @@ function certs_get_certificate_by_order($connection, $orderId)
     return $rows[0];
 }
 
-function certs_create_certificate($connection, $order, $paymentProvider, $paidAmount, $rawPayloadJson)
+function certs_create_certificate($connection, $order, $event)
 {
     $code = 1000000 + intval($order['id']);
     $password = certs_generate_password();
@@ -77,8 +87,19 @@ function certs_create_certificate($connection, $order, $paymentProvider, $paidAm
         'utm_referrer' => $order['utm_referrer'],
         'ya_cid' => $order['ya_cid'],
         'google_cid' => $order['google_cid'],
-        'payload' => $rawPayloadJson,
-        'paid_amount' => $paidAmount
+        'payment_provider' => $event['provider'],
+        'payment_status' => $event['status'],
+        'payment_status_raw' => isset($event['status_raw']) ? $event['status_raw'] : '',
+        'external_payment_id' => isset($event['external_payment_id']) ? $event['external_payment_id'] : '',
+        'payment_init' => isset($event['metadata']['payment_init']) ? $event['metadata']['payment_init'] : '',
+        'commission_percent' => isset($event['metadata']['commission']) ? floatval($event['metadata']['commission']) : 0,
+        'commission_sum' => isset($event['metadata']['commission_sum']) ? floatval($event['metadata']['commission_sum']) : 0,
+        'currency' => $event['currency'],
+        'sum' => $event['amount'],
+        'currency_sum' => isset($event['metadata']['currency_sum']) ? $event['metadata']['currency_sum'] : '',
+        'currency_commission_sum' => isset($event['metadata']['currency_commission_sum']) ? $event['metadata']['currency_commission_sum'] : '',
+        'params' => certs_extract_params($event['metadata']),
+        'payload' => $event['payload_raw']
     );
 
     $sql = 'INSERT INTO hksxq_certificates (order_id, idu, code, amount_initial, amount_remaining, currency, status, valid_from, valid_until, created, origin, external_ref, email_snapshot, name_snapshot, pass_cert, md5_pass_cert, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
@@ -93,8 +114,8 @@ function certs_create_certificate($connection, $order, $paymentProvider, $paidAm
         $now,
         $validUntil,
         $now,
-        $paymentProvider,
-        '',
+        $event['provider'],
+        isset($event['external_payment_id']) ? $event['external_payment_id'] : '',
         $order['email'],
         $order['name'],
         $password,
@@ -108,6 +129,20 @@ function certs_create_certificate($connection, $order, $paymentProvider, $paidAm
     }
 
     return certs_get_certificate_by_order($connection, $order['id']);
+}
+
+function certs_extract_params($metadata)
+{
+    $params = array();
+    if (!is_array($metadata)) {
+        return $params;
+    }
+    foreach ($metadata as $key => $value) {
+        if (strpos($key, '_param_') === 0 || strpos($key, 'utm_') === 0 || $key === 'ref' || $key === 'payment_type') {
+            $params[$key] = $value;
+        }
+    }
+    return $params;
 }
 
 function certs_generate_password()

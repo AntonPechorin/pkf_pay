@@ -3,9 +3,16 @@
 
 return array(
     'prodamus' => array(
-        // Два секрета для разных аккаунтов (например, два ИП). Ключ выбирается по shop_id, если нужно.
-        'secret_main' => 'prodamus_secret_main',
-        'secret_alt' => 'prodamus_secret_alt',
+        // Массив секретных ключей из личного кабинета Prodamus (URL и секретный ключ платежной страницы).
+        // Проверка подписи выполняется по каждому ключу последовательно до совпадения.
+        'secret_keys' => array(
+            'prodamus_secret_main',
+            'prodamus_secret_alt'
+        ),
+        // Код системы (sys) из настроек платежной страницы.
+        'sys' => 'prostovtak',
+        // URL уведомлений (webhook), который указывается при формировании ссылки.
+        'notification_url' => 'https://api.perexodvtak.ru/pay/prodamus',
         // Валюта по умолчанию (если провайдер не передал валюту или нужно пересчитать в RUB).
         'default_currency' => 'RUB'
     ),

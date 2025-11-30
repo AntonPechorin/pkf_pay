@@ -30,5 +30,9 @@ define('ATOL_ENABLED', false);
 // Срок действия сертификатов (в днях).
 define('CERT_VALID_DAYS', 365);
 
+// Базовый сдвиг номера заказа сертификата для внешних систем (Prodamus).
+// Внешний номер заказа сертификата = BASE_CERT_ORDER_NUM + id.
+define('BASE_CERT_ORDER_NUM', 500000000);
+
 // Кодировка БД (по умолчанию utf8mb4 для MySQL 5.7).
 define('DB_CHARSET', 'utf8mb4');

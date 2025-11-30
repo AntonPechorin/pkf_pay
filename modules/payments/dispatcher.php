@@ -49,15 +49,7 @@ function payments_process_certificate($connection, $event, $atolConfig)
         return array('success' => false, 'error' => 'Ошибка транзакции');
     }
 
-    $certResult = certs_handle_payment_result(
-        $event['order_id'],
-        $event['provider'],
-        $event['status'],
-        $event['amount'],
-        $event['currency'],
-        $event['payload_raw'],
-        $connection
-    );
+    $certResult = certs_handle_payment_result($event, $connection);
 
     if (!$certResult['success']) {
         db_rollback($connection);
