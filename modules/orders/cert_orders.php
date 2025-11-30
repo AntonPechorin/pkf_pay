@@ -14,6 +14,18 @@ function cert_orders_get_by_id($connection, $orderId)
     return $rows[0];
 }
 
+function cert_orders_get_by_external_order_num($connection, $externalOrderNum)
+{
+    $sql  = 'SELECT * FROM hksxq_cert_orders WHERE external_order_num = ? LIMIT 1';
+    $rows = db_query_select($connection, $sql, array($externalOrderNum));
+
+    if ($rows === false || count($rows) === 0) {
+        return null;
+    }
+
+    return $rows[0];
+}
+
 function cert_orders_update_payment_fields($connection, $orderId, $provider, $externalId, $status, $payload)
 {
     $sql = 'UPDATE hksxq_cert_orders SET payment_provider = ?, payment_external_id = ?, payment_status = ?, payment_payload = ?, updated_at = NOW() WHERE id = ?';

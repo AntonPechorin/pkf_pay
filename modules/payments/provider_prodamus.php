@@ -3,6 +3,8 @@ require_once __DIR__ . '/../../lib/logger.php';
 require_once __DIR__ . '/../../lib/helpers.php';
 require_once __DIR__ . '/../../lib/response.php';
 require_once __DIR__ . '/../../lib/prodamus_hmac.php';
+require_once __DIR__ . '/../../lib/db_connection.php';
+require_once __DIR__ . '/../orders/cert_orders.php';
 require_once __DIR__ . '/../../config/config.php';
 
 /**
@@ -63,6 +65,7 @@ function provider_prodamus_handle($headers, $rawBody)
     }
 
     $orderNumRaw = $data['order_num'];
+
     $primaryPart = $orderNumRaw;
     if (strpos($orderNumRaw, '-') !== false) {
         $parts = explode('-', $orderNumRaw);
@@ -72,9 +75,30 @@ function provider_prodamus_handle($headers, $rawBody)
 
     $orderType = 'course';
     $internalOrderId = $primaryNumeric;
-    if ($primaryNumeric >= BASE_CERT_ORDER_NUM) {
+
+    $connection = db_get_connection();
+
+    $certOrder = cert_orders_get_by_external_order_num($connection, $orderNumRaw);
+    if ($certOrder === null && $primaryPart !== $orderNumRaw) {
+        $certOrder = cert_orders_get_by_external_order_num($connection, $primaryPart);
+    }
+
+    if ($certOrder !== null) {
         $orderType = 'certificate';
-        $internalOrderId = $primaryNumeric - BASE_CERT_ORDER_NUM;
+        $internalOrderId = intval($certOrder['id']);
+
+        logger_info(
+            'Prodamus: найден заказ сертификата по external_order_num=' . $orderNumRaw . ' (id=' . $internalOrderId . ')',
+            $channel
+        );
+    } else {
+        $orderType = 'course';
+        $internalOrderId = $primaryNumeric;
+
+        logger_info(
+            'Prodamus: сертификат по external_order_num не найден, обрабатываем как курс id=' . $internalOrderId,
+            $channel
+        );
     }
 
     $statusRaw = isset($data['payment_status']) ? $data['payment_status'] : '';
